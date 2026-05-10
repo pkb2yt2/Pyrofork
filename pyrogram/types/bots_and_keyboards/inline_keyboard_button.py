@@ -90,7 +90,8 @@ class InlineKeyboardButton(Object):
         switch_inline_query_current_chat: Optional[str] = None,
         callback_game: Optional["types.CallbackGame"] = None,
         requires_password: Optional[bool] = None,
-        copy_text: Optional[str] = None
+        copy_text: Optional[str] = None,
+        icon_custom_emoji_id: Optional[int] = None
     ):
         super().__init__()
 
@@ -106,10 +107,11 @@ class InlineKeyboardButton(Object):
         self.requires_password = requires_password
         # self.pay = pay
         self.copy_text = copy_text
+        self.icon_custom_emoji_id = icon_custom_emoji_id
 
     @staticmethod
     def read(b: "raw.base.KeyboardButton"):
-        if isinstance(b, raw.types.KeyboardButtonCallback):
+        if isinstance(b, (raw.types.KeyboardButtonCallback, raw.types.KeyboardButtonCallback2)):
             # Try decode data to keep it as string, but if fails, fallback to bytes so we don't lose any information,
             # instead of decoding by ignoring/replacing errors.
             try:
@@ -117,10 +119,12 @@ class InlineKeyboardButton(Object):
             except UnicodeDecodeError:
                 data = b.data
 
+            style = getattr(b, "style", None)
             return InlineKeyboardButton(
                 text=b.text,
                 callback_data=data,
-                requires_password=getattr(b, "requires_password", None)
+                requires_password=getattr(b, "requires_password", None),
+                icon_custom_emoji_id=getattr(style, "icon", None) if style is not None else None
             )
 
         if isinstance(b, raw.types.KeyboardButtonUrl):
@@ -180,6 +184,14 @@ class InlineKeyboardButton(Object):
         if self.callback_data is not None:
             # Telegram only wants bytes, but we are allowed to pass strings too, for convenience.
             data = bytes(self.callback_data, "utf-8") if isinstance(self.callback_data, str) else self.callback_data
+
+            if self.icon_custom_emoji_id is not None:
+                return raw.types.KeyboardButtonCallback2(
+                    text=self.text,
+                    data=data,
+                    requires_password=self.requires_password,
+                    style=raw.types.KeyboardButtonStyle(icon=self.icon_custom_emoji_id)
+                )
 
             return raw.types.KeyboardButtonCallback(
                 text=self.text,
