@@ -57,6 +57,25 @@ class Session:
     PING_INTERVAL = 5
     STORED_MSG_IDS_MAX_SIZE = 500
 
+    # ── Response-starvation recovery ────────────────────────────────────
+    # The keep-alive ping below is normally fire-and-forget (wait_response
+    # =False). That makes it blind to the "half-wedged" session: the TCP
+    # socket is alive and recv_worker keeps reading bytes (so it never
+    # returns None and never triggers restart()), but the server has
+    # stopped answering our RPCs — every real send() waits out its full
+    # timeout and raises TimeoutError, indefinitely, with no recovery.
+    #
+    # Fix: send the keep-alive WITH a response wait and treat it as a
+    # liveness probe. A Pong reply (or even an RPCError) proves the
+    # request/response path is alive and resets the counter. PING_HEALTH_
+    # MISSES consecutive probes with no reply == the session is wedged →
+    # trigger pyrofork's own in-process restart() (a clean ~10-15s
+    # transport re-handshake; handlers/plugins/process all stay intact).
+    # No os._exit, no dyno restart. Applied to the MAIN/auth session only;
+    # media/CDN sessions keep the stock fire-and-forget ping (see ping_worker).
+    PING_PROBE_TIMEOUT = 10      # per-probe wait for the Pong
+    PING_HEALTH_MISSES = 3       # consecutive misses (~3×PING_INTERVAL ≈ 15s) → restart
+
     TRANSPORT_ERRORS = {
         404: "auth key not found",
         429: "transport flood",
@@ -164,6 +183,17 @@ class Session:
         self.is_started.clear()
 
         self.stored_msg_ids.clear()
+
+        # Wake any send() coroutines that are blocked waiting on a response
+        # that will never arrive on this (about-to-die) connection. Without
+        # this, each one sits out its full WAIT_TIMEOUT after the restart
+        # before raising TimeoutError. Setting the event lets them resume
+        # now, pop a None value, and raise/retry against the fresh session
+        # immediately. (The msg_ids are dead the moment the connection
+        # closes, so there's nothing to lose by releasing them early.)
+        for _result in list(self.results.values()):
+            if not _result.event.is_set():
+                _result.event.set()
 
         self.ping_task_event.set()
 
@@ -282,6 +312,21 @@ class Session:
     async def ping_worker(self):
         log.info("PingTask started")
 
+        # Only the MAIN/auth session (carries send_message, get_me, all the
+        # text RPCs) runs the response-starvation probe. Media/CDN sessions
+        # stream SaveBigFilePart/GetFile chunks where a control Pong can
+        # legitimately queue behind chunk traffic — restarting one mid-
+        # transfer would abort an upload/download. They keep the original
+        # fire-and-forget keep-alive (zero behaviour change), and they're
+        # already recovered on a genuinely dead socket by recv_worker. The
+        # real-world wedge we're fixing was on the main session.
+        probe_health = not (self.is_media or self.is_cdn)
+
+        # Consecutive keep-alive probes that got no reply. Reset to 0 the
+        # moment the server answers (Pong or even an RPCError — both prove
+        # the request/response path is alive). See PING_HEALTH_MISSES.
+        health_misses = 0
+
         while True:
             try:
                 await asyncio.wait_for(self.ping_task_event.wait(), self.PING_INTERVAL)
@@ -290,17 +335,76 @@ class Session:
             else:
                 break
 
+            if not probe_health:
+                # ── Original fire-and-forget keep-alive (media/CDN) ──
+                try:
+                    await self.send(
+                        raw.functions.PingDelayDisconnect(
+                            ping_id=0, disconnect_delay=self.WAIT_TIMEOUT + 10
+                        ), False
+                    )
+                except OSError:
+                    self.loop.create_task(self.restart())
+                    break
+                except RPCError:
+                    pass
+                continue
+
+            # ── Main session: keep-alive doubles as a liveness probe ──
+            # Only probe once the session is fully up. During start()/
+            # restart() the InitConnection handshake is still in flight;
+            # probing then could race and false-trigger a second restart.
+            if not self.is_started.is_set():
+                continue
+
             try:
+                # Was wait_response=False (fire-and-forget). Now we WAIT for
+                # the Pong so a wedged-but-connected session is detectable:
+                # no Pong within PING_PROBE_TIMEOUT == a miss.
                 await self.send(
                     raw.functions.PingDelayDisconnect(
                         ping_id=0, disconnect_delay=self.WAIT_TIMEOUT + 10
-                    ), False
+                    ),
+                    timeout=self.PING_PROBE_TIMEOUT
                 )
+                # Server answered — path is healthy.
+                health_misses = 0
+            except (asyncio.TimeoutError, TimeoutError):
+                # ORDER MATTERS: this clause MUST come before `except OSError`.
+                # On Python 3.11+ (we run 3.12) the builtin TimeoutError — and
+                # its alias asyncio.TimeoutError — is a SUBCLASS of OSError, so
+                # a bare `except OSError` first would swallow the probe timeout
+                # and we'd never count misses.
+                #
+                # No reply in time == the half-wedge signal: recv_worker is
+                # still happily reading bytes (so it won't restart on its own),
+                # but our RPCs are going unanswered. Count it; once we cross
+                # the threshold, force the same in-process reconnect recv_worker
+                # would do on a dead socket. (self.restart is wrapped single-
+                # flight by the app's session patch, so concurrent restart
+                # requests from recv_worker/handle_packet collapse to one.)
+                health_misses += 1
+                log.warning(
+                    "Keep-alive probe got no reply (%s/%s) — session may be "
+                    "wedged (socket alive, RPCs unanswered).",
+                    health_misses, self.PING_HEALTH_MISSES
+                )
+                if health_misses >= self.PING_HEALTH_MISSES:
+                    log.warning(
+                        "Keep-alive starvation threshold reached — forcing "
+                        "session restart (in-process, no process exit)."
+                    )
+                    self.loop.create_task(self.restart())
+                    break
             except OSError:
+                # Genuine socket-level failure (connection.send wraps socket
+                # errors as OSError). The original behaviour — reconnect now.
                 self.loop.create_task(self.restart())
                 break
             except RPCError:
-                pass
+                # The server answered with an error — the request/response
+                # path is alive, which is all this probe checks. Not a miss.
+                health_misses = 0
 
         log.info("PingTask stopped")
 
