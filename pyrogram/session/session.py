@@ -202,7 +202,13 @@ class Session:
 
         self.ping_task_event.clear()
 
-        await self.connection.close()
+        # Guard against stopping a session that never started (connection is None
+        # until start() assigns it at session.py:127). Without this, stopping a
+        # not-yet-started session — e.g. one sibling of a parallel multi-session
+        # upload whose start() raised before connecting — throws AttributeError
+        # and leaks the others. Makes stop() idempotent/safe on a cold session.
+        if self.connection is not None:
+            await self.connection.close()
 
         if self.recv_task:
             await self.recv_task

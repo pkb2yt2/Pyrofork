@@ -112,6 +112,22 @@ class SaveFile:
 
             part_size = 512 * 1024
 
+            # ── Multi-session parallel upload (FastTelethon-style) ──────────────
+            # Stock pyrofork creates ONE Session and N workers sharing it, so the
+            # N chunks still serialize over a SINGLE TCP connection — throughput is
+            # latency-bound (~4 chunks per round-trip). Opening N SEPARATE Sessions
+            # to the same media DC lets N chunks fly over N independent connections
+            # at once, hiding round-trip latency → several-x faster on a high-RTT
+            # host (Heroku→Telegram). Connection count scales with file size and is
+            # capped (PYROFORK_UPLOAD_MAX_SESSIONS, default 8) to stay clear of
+            # Telegram per-IP flood limits. Tunable via env at runtime.
+            import os as _os
+            try:
+                _max_up_sessions = int(_os.environ.get("PYROFORK_UPLOAD_MAX_SESSIONS", "8") or "8")
+            except ValueError:
+                _max_up_sessions = 8
+            _max_up_sessions = max(1, min(16, _max_up_sessions))
+
             if isinstance(path, (str, PurePath)):
                 fp = open(path, "rb")
             elif isinstance(path, io.IOBase):
@@ -135,19 +151,49 @@ class SaveFile:
 
             file_total_parts = int(math.ceil(file_size / part_size))
             is_big = file_size > 10 * 1024 * 1024
-            workers_count = 4 if is_big else 1
             is_missing_part = file_id is not None
+            # Scale connection count with size: ~1 session per 100 MB, between 4
+            # and the configured max, never more than there are parts to send.
+            # A single missing-part re-upload needs just one connection.
+            if is_big and not is_missing_part:
+                workers_count = min(
+                    _max_up_sessions,
+                    max(4, int(math.ceil(file_size / (100 * 1024 * 1024)))),
+                    max(1, file_total_parts),
+                )
+            else:
+                workers_count = 1
             file_id = file_id or self.rnd_id()
             md5_sum = md5() if not is_big and not is_missing_part else None
-            session = Session(
-                self, await self.storage.dc_id(), await self.storage.auth_key(),
-                await self.storage.test_mode(), is_media=True
-            )
-            workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
-            queue = asyncio.Queue(1)
+
+            # One independent Session per worker (was a single shared session).
+            _dc_id = await self.storage.dc_id()
+            _auth_key = await self.storage.auth_key()
+            _test_mode = await self.storage.test_mode()
+            sessions = [
+                Session(self, _dc_id, _auth_key, _test_mode, is_media=True)
+                for _ in range(workers_count)
+            ]
+            # Backwards-compat alias: the non-big md5 path and the finally block
+            # below were written around a single `session`; keep one named.
+            session = sessions[0]
+            # Deeper queue so the producer can stage chunks ahead of N workers
+            # instead of blocking after every single put (old maxsize was 1).
+            queue = asyncio.Queue(max(1, workers_count * 2))
+            workers = [self.loop.create_task(worker(s)) for s in sessions]
 
             try:
-                await session.start()
+                # Start all sessions; return_exceptions so one failing start()
+                # doesn't leave its siblings mid-connect (default gather leaves
+                # them running). If ANY session failed to start, abort the whole
+                # upload — the finally still stops every session (stop() is now
+                # None-safe), so nothing leaks.
+                _start_results = await asyncio.gather(
+                    *[s.start() for s in sessions], return_exceptions=True
+                )
+                _start_errors = [r for r in _start_results if isinstance(r, BaseException)]
+                if _start_errors:
+                    raise _start_errors[0]
 
                 fp.seek(part_size * file_part)
 
@@ -220,7 +266,10 @@ class SaveFile:
 
                 await asyncio.gather(*workers)
 
-                await session.stop()
+                # Stop EVERY session we opened (was a single session.stop()).
+                await asyncio.gather(
+                    *[s.stop() for s in sessions], return_exceptions=True
+                )
 
                 if isinstance(path, (str, PurePath)):
                     fp.close()
