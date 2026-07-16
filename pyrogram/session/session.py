@@ -73,8 +73,19 @@ class Session:
     # transport re-handshake; handlers/plugins/process all stay intact).
     # No os._exit, no dyno restart. Applied to the MAIN/auth session only;
     # media/CDN sessions keep the stock fire-and-forget ping (see ping_worker).
-    PING_PROBE_TIMEOUT = 10      # per-probe wait for the Pong
-    PING_HEALTH_MISSES = 3       # consecutive misses (~3×PING_INTERVAL ≈ 15s) → restart
+    # Heal-within-seconds tuning (2026-07-13). A healthy main-session Pong
+    # returns in well under 1s, so a short probe timeout + low miss threshold
+    # detects a wedge FAST without false-positives on a merely-slow-but-alive
+    # session. Old values (10s probe × 3 misses on a 5s interval ≈ 30-45s to
+    # restart) left the bot deaf for that whole window. New: 3s probe × 2 misses,
+    # and once the FIRST miss happens the loop re-probes on a short backoff
+    # (PING_WEDGE_BACKOFF) instead of the full 5s idle interval — so a real wedge
+    # is confirmed + restart()ed in ~4-7s, not 30-45s. The interactive-reply
+    # side is covered separately by the session-patch MAIN_WAIT_TIMEOUT (sends
+    # fail fast so dispatcher workers aren't held) — this is the detection side.
+    PING_PROBE_TIMEOUT = 3       # per-probe wait for the Pong (was 10)
+    PING_HEALTH_MISSES = 2       # consecutive misses → restart (was 3)
+    PING_WEDGE_BACKOFF = 1.0     # while mid-miss, re-probe this fast (not PING_INTERVAL)
 
     TRANSPORT_ERRORS = {
         404: "auth key not found",
@@ -334,8 +345,13 @@ class Session:
         health_misses = 0
 
         while True:
+            # Idle cadence is PING_INTERVAL; but once we've seen a miss (a wedge
+            # may be starting) re-probe on the short PING_WEDGE_BACKOFF so 2
+            # misses confirm in ~a few seconds instead of ~10s. Only applies to
+            # the health-probing main session (health_misses stays 0 otherwise).
+            _wait = self.PING_WEDGE_BACKOFF if (probe_health and health_misses > 0) else self.PING_INTERVAL
             try:
-                await asyncio.wait_for(self.ping_task_event.wait(), self.PING_INTERVAL)
+                await asyncio.wait_for(self.ping_task_event.wait(), _wait)
             except asyncio.TimeoutError:
                 pass
             else:

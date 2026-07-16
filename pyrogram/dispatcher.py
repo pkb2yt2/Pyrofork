@@ -340,6 +340,19 @@ class Dispatcher:
 
         self.loop.create_task(fn())
 
+    # Transient/benign failures that mean "the socket blinked", not a logic bug:
+    # a session-restart-in-flight TimeoutError (raised by the app's session patch
+    # while the main session rebuilds), plain read timeouts, and connection drops.
+    # When a packet's PARSER touches the network (e.g. CallbackQuery._parse ->
+    # get_messages during a session rebuild) it raises here, BEFORE any handler
+    # runs, so _handle_exception never sees it — without this it fans out a full
+    # ~30-line traceback per queued callback during every restart. Condense those
+    # to one WARNING; genuine parse/handler bugs still get the full traceback.
+    _TRANSIENT_PACKET_EXC = (
+        TimeoutError, asyncio.TimeoutError, ConnectionError,
+        ConnectionResetError, ConnectionAbortedError,
+    )
+
     async def handler_worker(self, lock: asyncio.Lock):
         while True:
             packet = await self.updates_queue.get()
@@ -352,7 +365,16 @@ class Dispatcher:
             except pyrogram.StopPropagation:
                 pass
             except Exception as e:
-                log.exception(e)
+                if isinstance(e, self._TRANSIENT_PACKET_EXC) or (
+                    "request timed out" in str(e).lower()
+                ):
+                    log.warning(
+                        "handler_worker: transient failure processing update "
+                        "(%s: %s) — session was briefly unavailable; suppressing "
+                        "traceback (the user can re-run).", type(e).__name__, e,
+                    )
+                else:
+                    log.exception(e)
             finally:
                 self.updates_queue.task_done()
 
