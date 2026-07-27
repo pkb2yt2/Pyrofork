@@ -49,13 +49,29 @@ class Result:
 
 
 class Session:
-    START_TIMEOUT = 2
+    # Handshake Ping/InitConnection wait. Was 2s — under event-loop pressure
+    # (Heroku R14 / concurrent work) that false-failed start() with TimeoutError
+    # and left is_started clear forever when combined with an unbounded retry
+    # loop. 5s is still far above a healthy DC reply (<1s) but survives brief
+    # stalls. App-level session patches may raise this further for main only.
+    START_TIMEOUT = 5
     WAIT_TIMEOUT = 15
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 10
     ACKS_THRESHOLD = 10
     PING_INTERVAL = 5
     STORED_MSG_IDS_MAX_SIZE = 500
+    # Main-session start() attempt cap. Stock was `while True` forever — if the
+    # DC was unreachable, restart() = stop()+start() never returned, which held
+    # any single-flight restart flag forever and made every invoke fail with
+    # "session restart in-flight". Media/CDN keep unbounded retry (slow upload
+    # DC must not give up mid-transfer). None = unbounded.
+    START_MAX_ATTEMPTS_MAIN = 5
+    # Bound stop() worker drains so a wedged recv/ping task cannot hang
+    # restart() indefinitely (restart = stop + start).
+    STOP_TASK_DRAIN_TIMEOUT = 8.0
+    STOP_TASK_CANCEL_TIMEOUT = 3.0
+    STOP_CONNECTION_CLOSE_TIMEOUT = 10.0
 
     # ── Response-starvation recovery ────────────────────────────────────
     # The keep-alive ping below is normally fire-and-forget (wait_response
@@ -134,7 +150,18 @@ class Session:
         self.loop = asyncio.get_event_loop()
 
     async def start(self):
+        # Main session: bound attempts so start() always returns (success or
+        # ConnectionError). Unbounded while-True left restart() hanging forever
+        # when Telegram/connect timed out, which is catastrophic for any
+        # single-flight restart guard (invoke fails with "restart in-flight"
+        # until the process dies). Media/CDN remain unbounded.
+        _is_main = not (self.is_media or self.is_cdn)
+        _max_attempts = self.START_MAX_ATTEMPTS_MAIN if _is_main else None
+        _attempt = 0
+        _last_err = None
+
         while True:
+            _attempt += 1
             self.connection = self.client.connection_factory(
                 dc_id=self.dc_id,
                 test_mode=self.test_mode,
@@ -178,8 +205,27 @@ class Session:
             except AuthKeyDuplicated as e:
                 await self.stop()
                 raise e
-            except (OSError, RPCError):
+            except (OSError, RPCError, TimeoutError, asyncio.TimeoutError) as e:
+                # TimeoutError is a subclass of OSError on Py3.10+, but list
+                # it explicitly so the intent is obvious and so a future
+                # stdlib change cannot drop it from the soft-retry path.
+                _last_err = e
                 await self.stop()
+                if _max_attempts is not None and _attempt >= _max_attempts:
+                    raise ConnectionError(
+                        f"start() failed after {_attempt} attempts "
+                        f"(last error: {type(e).__name__}: {e})"
+                    ) from e
+                # Soft backoff — avoid hammering a flapping DC / thrashing dyno.
+                _backoff = min(2 ** max(_attempt - 1, 0), 8)
+                log.warning(
+                    "Session start attempt %s/%s failed (%s: %s); "
+                    "soft backoff %ss then retry.",
+                    _attempt,
+                    _max_attempts if _max_attempts is not None else "∞",
+                    type(e).__name__, e, _backoff,
+                )
+                await asyncio.sleep(_backoff)
             except Exception as e:
                 await self.stop()
                 raise e
@@ -189,6 +235,32 @@ class Session:
         self.is_started.set()
 
         log.info("Session started")
+
+    async def _drain_task(self, task, name: str) -> None:
+        """Await a worker task with a timeout; force-cancel if it hangs.
+
+        Used by stop() so a wedged recv_worker/ping_worker cannot block
+        restart() forever (restart = await stop(); await start()).
+        """
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.STOP_TASK_DRAIN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "%s did not exit within %ss during stop() — force-cancelling.",
+                name, self.STOP_TASK_DRAIN_TIMEOUT,
+            )
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=self.STOP_TASK_CANCEL_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def stop(self):
         self.is_started.clear()
@@ -208,21 +280,25 @@ class Session:
 
         self.ping_task_event.set()
 
-        if self.ping_task is not None:
-            await self.ping_task
+        await self._drain_task(self.ping_task, "ping_task")
 
         self.ping_task_event.clear()
 
         # Guard against stopping a session that never started (connection is None
-        # until start() assigns it at session.py:127). Without this, stopping a
-        # not-yet-started session — e.g. one sibling of a parallel multi-session
-        # upload whose start() raised before connecting — throws AttributeError
-        # and leaks the others. Makes stop() idempotent/safe on a cold session.
+        # until start() assigns it). Without this, stopping a not-yet-started
+        # session — e.g. one sibling of a parallel multi-session upload whose
+        # start() raised before connecting — throws AttributeError and leaks
+        # the others. Makes stop() idempotent/safe on a cold session.
         if self.connection is not None:
-            await self.connection.close()
+            try:
+                await asyncio.wait_for(
+                    self.connection.close(),
+                    timeout=self.STOP_CONNECTION_CLOSE_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
+                log.warning("connection.close() during stop() raised/timed out: %s", e)
 
-        if self.recv_task:
-            await self.recv_task
+        await self._drain_task(self.recv_task, "recv_task")
 
         if not self.is_media and callable(self.client.disconnect_handler):
             try:

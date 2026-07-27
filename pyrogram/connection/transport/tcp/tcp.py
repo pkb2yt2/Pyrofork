@@ -127,12 +127,25 @@ class TCP:
             raise TimeoutError("Connection timed out")
 
     async def close(self) -> None:
-        if self.writer is None:
+        # Always null BOTH reader and writer, even when writer was already
+        # None (e.g. a half-torn connect). Leaving a stale reader alive is
+        # what produced the production "NoneType has no attribute 'read'"
+        # wedge: a concurrent reconnect set reader=None mid-recv while the
+        # old recv_worker was still awaiting reader.read(...), AttributeError
+        # escaped the OSError-only except, and recv_worker died without
+        # scheduling restart() — session stuck "started" with no network
+        # task. Nulling both refs makes a subsequent recv() take the clean
+        # "return None" path so recv_worker self-heals via restart().
+        writer = self.writer
+        self.writer = None
+        self.reader = None
+
+        if writer is None:
             return None
 
         try:
-            self.writer.close()
-            await asyncio.wait_for(self.writer.wait_closed(), TCP.TIMEOUT)
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), TCP.TIMEOUT)
         except Exception as e:
             log.info("Close exception: %s %s", type(e).__name__, e)
 
@@ -149,16 +162,42 @@ class TCP:
                 raise OSError(e)
 
     async def recv(self, length: int = 0) -> Optional[bytes]:
+        # Defensive: connection already closed (or close() raced us). None is
+        # the existing "dead connection" sentinel recv_worker already handles
+        # by scheduling restart(). Without this check, a concurrent close()
+        # that nulled self.reader raises AttributeError which stock code did
+        # NOT catch (only OSError/TimeoutError) → silent recv_worker death.
+        if self.reader is None:
+            return None
+
         data = b""
 
         while len(data) < length:
             try:
+                # Re-check each iteration — close() may race mid-loop.
+                reader = self.reader
+                if reader is None:
+                    return None
                 chunk = await asyncio.wait_for(
-                    self.reader.read(length - len(data)),
+                    reader.read(length - len(data)),
                     TCP.TIMEOUT
                 )
             except (OSError, asyncio.TimeoutError):
                 return None
+            except AttributeError as e:
+                # reader became None between the check and the read, or
+                # StreamReader internals raced with close(). Treat as dead.
+                if "NoneType" in str(e):
+                    return None
+                raise
+            except RuntimeError as e:
+                # "read() called while another coroutine is already waiting
+                # for incoming data" — two recv_workers on the same reader
+                # after a raced restart(). Clean dead-sentinel → one restart.
+                msg = str(e)
+                if "already waiting" in msg or "incoming data" in msg:
+                    return None
+                raise
             else:
                 if chunk:
                     data += chunk
