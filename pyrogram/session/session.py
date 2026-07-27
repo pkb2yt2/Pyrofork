@@ -66,7 +66,10 @@ class Session:
     # any single-flight restart flag forever and made every invoke fail with
     # "session restart in-flight". Media/CDN keep unbounded retry (slow upload
     # DC must not give up mid-transfer). None = unbounded.
-    START_MAX_ATTEMPTS_MAIN = 5
+    # Keep in sync with app session_patch soft budget when both are used;
+    # media/CDN ignore this (unbounded). 4 is enough soft tries without
+    # making one start() series longer than typical watchdog patience.
+    START_MAX_ATTEMPTS_MAIN = 4
     # Bound stop() worker drains so a wedged recv/ping task cannot hang
     # restart() indefinitely (restart = stop + start).
     STOP_TASK_DRAIN_TIMEOUT = 8.0
@@ -310,7 +313,14 @@ class Session:
 
     async def restart(self):
         await self.stop()
-        await self.start()
+        try:
+            await self.start()
+        except ConnectionError as e:
+            # Bounded main start() raises when the DC is unreachable. Callers
+            # often fire-and-forget create_task(restart()); swallow here so we
+            # do not spam "Task exception was never retrieved". is_started
+            # stays clear — app watchdog / next activity can retry.
+            log.warning("Session restart failed: %s", e)
 
     async def handle_packet(self, packet):
         try:

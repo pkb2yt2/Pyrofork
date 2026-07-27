@@ -74,7 +74,16 @@ class Connection:
             raise ConnectionError
 
     async def close(self) -> None:
-        await self.protocol.close()
+        # Idempotent: stop()/restart can call close more than once (app
+        # session_patch pre-closes, then stock stop closes again). Never
+        # AttributeError on a second close when protocol is already gone.
+        protocol = self.protocol
+        self.protocol = None
+        if protocol is not None:
+            try:
+                await protocol.close()
+            except Exception as e:
+                log.warning("protocol.close() raised during connection close: %s", e)
         log.info("Disconnected")
 
     async def send(self, data: bytes) -> None:
