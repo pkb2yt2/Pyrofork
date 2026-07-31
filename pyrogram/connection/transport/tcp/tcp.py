@@ -150,10 +150,16 @@ class TCP:
             log.info("Close exception: %s %s", type(e).__name__, e)
 
     async def send(self, data: bytes) -> None:
+        # Fail-closed: never silently "succeed" when the transport is dead.
+        # A silent return left Session.send waiting full WAIT_TIMEOUT for a
+        # reply that will never come (half-wedge / delayed bot replies).
         if self.writer is None:
-            return None
+            raise OSError("TCP connection is closed (writer is None)")
 
         async with self.lock:
+            # Re-check under the lock — close() may have raced us.
+            if self.writer is None:
+                raise OSError("TCP connection is closed (writer is None)")
             try:
                 self.writer.write(data)
                 await self.writer.drain()

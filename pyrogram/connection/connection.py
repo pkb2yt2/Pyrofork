@@ -87,7 +87,15 @@ class Connection:
         log.info("Disconnected")
 
     async def send(self, data: bytes) -> None:
-        await self.protocol.send(data)
+        # Fail-closed: concurrent close() nulls protocol — never AttributeError
+        # on None.send (production: "session connection send race").
+        protocol = self.protocol
+        if protocol is None:
+            raise OSError("connection is not connected (protocol is None)")
+        await protocol.send(data)
 
     async def recv(self) -> Optional[bytes]:
-        return await self.protocol.recv()
+        protocol = self.protocol
+        if protocol is None:
+            return None
+        return await protocol.recv()

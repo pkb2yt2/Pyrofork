@@ -152,6 +152,24 @@ class Session:
 
         self.loop = asyncio.get_event_loop()
 
+        # Single-flight restart: waiters AWAIT completion (never fail-fast
+        # "restart in-flight"). Process/dyno exit is the app's last resort —
+        # session recovery stays in-process here.
+        self._restart_lock = asyncio.Lock()
+        self._restart_done = asyncio.Event()
+        self._restart_done.set()  # no restart in progress at birth
+        self._restart_generation = 0
+        # Task currently running restart() critical section — send/invoke must
+        # NOT wait on the lock if they are that task (handshake uses send;
+        # waiting on the same lock = deadlock).
+        self._restart_owner_task = None
+        # Bound concurrent handle_updates so flood of pushes cannot starve
+        # interactive RPCs (0s user-visible downtime goal).
+        self._update_semaphore = asyncio.Semaphore(24)
+        self._packet_tasks: set = set()
+        self._last_restart_mono = 0.0
+        self.MIN_RESTART_INTERVAL = 5.0
+
     async def start(self):
         # Main session: bound attempts so start() always returns (success or
         # ConnectionError). Unbounded while-True left restart() hanging forever
@@ -281,6 +299,12 @@ class Session:
             if not _result.event.is_set():
                 _result.event.set()
 
+        # Cancel in-flight packet handlers so they don't race the next start.
+        for t in list(getattr(self, "_packet_tasks", set()) or set()):
+            t.cancel()
+        if getattr(self, "_packet_tasks", None):
+            self._packet_tasks.clear()
+
         self.ping_task_event.set()
 
         await self._drain_task(self.ping_task, "ping_task")
@@ -300,6 +324,7 @@ class Session:
                 )
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
                 log.warning("connection.close() during stop() raised/timed out: %s", e)
+            self.connection = None
 
         await self._drain_task(self.recv_task, "recv_task")
 
@@ -311,16 +336,166 @@ class Session:
 
         log.info("Session stopped")
 
-    async def restart(self):
-        await self.stop()
+    def _i_own_restart_lock(self) -> bool:
+        """True if the current task is the one running restart() critical section."""
         try:
-            await self.start()
-        except ConnectionError as e:
-            # Bounded main start() raises when the DC is unreachable. Callers
-            # often fire-and-forget create_task(restart()); swallow here so we
-            # do not spam "Task exception was never retrieved". is_started
-            # stays clear — app watchdog / next activity can retry.
-            log.warning("Session restart failed: %s", e)
+            return asyncio.current_task() is self._restart_owner_task
+        except Exception:
+            return False
+
+    async def _wait_if_restarting(self, timeout: Optional[float] = None) -> None:
+        """External callers wait for restart; the restart owner must not (deadlock)."""
+        if not self._restart_lock.locked() or self._i_own_restart_lock():
+            return
+        try:
+            await asyncio.wait_for(
+                self._restart_done.wait(),
+                timeout=timeout if timeout is not None else self.WAIT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError("Request timed out (waiting for session restart)")
+
+    async def restart(self):
+        """In-process transport recovery. Waiters block on the same lock until
+        done — interactive invoke never needs a dyno/process restart for this.
+
+        Soft reconnect under the lock (handshake uses send without waiting on
+        that lock). Falls back to classic stop→start if soft path fails.
+        """
+        import time as _time
+
+        # Nested call from the owner (e.g. invoke→restart while already in
+        # restart) — no-op, avoid deadlock.
+        if self._i_own_restart_lock():
+            return
+
+        # Already recovering — wait for it (wzgram-style). Do NOT raise.
+        if self._restart_lock.locked():
+            try:
+                await asyncio.wait_for(self._restart_done.wait(), timeout=45.0)
+            except asyncio.TimeoutError:
+                log.warning("Session restart wait timed out (45s); continuing")
+            return
+
+        async with self._restart_lock:
+            self._restart_owner_task = asyncio.current_task()
+            self._restart_done.clear()
+            try:
+                now = _time.monotonic()
+                # Anti-thrash ONLY when we have a live connection right after a
+                # successful restart. Never skip if connection is missing (that
+                # would leave the session permanently down for MIN interval).
+                if (
+                    self.is_started.is_set()
+                    and self.connection is not None
+                    and (now - self._last_restart_mono) < self.MIN_RESTART_INTERVAL
+                ):
+                    log.debug(
+                        "Session restart skipped (min interval %.1fs, connection live)",
+                        self.MIN_RESTART_INTERVAL,
+                    )
+                    return
+
+                soft_ok = False
+                if not (self.is_media or self.is_cdn):
+                    try:
+                        soft_ok = await self._restart_soft()
+                    except Exception as soft_err:
+                        log.warning(
+                            "Soft session restart failed (%s: %s); "
+                            "falling back to classic stop→start",
+                            type(soft_err).__name__, soft_err,
+                        )
+                        soft_ok = False
+
+                if not soft_ok:
+                    await self.stop()
+                    try:
+                        await self.start()
+                    except ConnectionError as e:
+                        log.warning("Session restart failed: %s", e)
+
+                self._last_restart_mono = _time.monotonic()
+                self._restart_generation += 1
+            finally:
+                self._restart_owner_task = None
+                self._restart_done.set()
+
+    async def _restart_soft(self) -> bool:
+        """Fast in-process reconnect under the restart lock.
+
+        Tear down old transport → new connect + handshake → ping worker.
+        Concurrent invoke/send wait on the lock (owner does not wait).
+        Typical blackout ~0.3–2s when the DC is healthy — not a dyno recycle.
+
+        Returns True on success. On exception, caller uses classic stop→start.
+        """
+        from pyrogram.raw.all import layer as _layer
+
+        # Soft-stop transport without clearing is_started until new link works.
+        self.stored_msg_ids.clear()
+        for _result in list(self.results.values()):
+            if not _result.event.is_set():
+                _result.event.set()
+
+        self.ping_task_event.set()
+        await self._drain_task(self.ping_task, "ping_task")
+        self.ping_task_event.clear()
+        self.ping_task = None
+
+        old_connection = self.connection
+        self.connection = None
+        await self._drain_task(self.recv_task, "recv_task")
+        self.recv_task = None
+        if old_connection is not None:
+            try:
+                await asyncio.wait_for(old_connection.close(), timeout=5.0)
+            except Exception as e:
+                log.debug("soft-restart close: %s", e)
+
+        new_connection = self.client.connection_factory(
+            dc_id=self.dc_id,
+            test_mode=self.test_mode,
+            ipv6=self.client.ipv6,
+            alt_port=self.client.alt_port,
+            proxy=self.client.proxy,
+            media=self.is_media,
+            protocol_factory=self.client.protocol_factory,
+        )
+        self.connection = new_connection
+        try:
+            await new_connection.connect()
+            self.recv_task = self.loop.create_task(self.recv_worker())
+            hs = max(float(self.START_TIMEOUT or 5), 6.0)
+            # send() must not wait on restart lock — we own it (see _i_own_restart_lock).
+            await self.send(raw.functions.Ping(ping_id=0), timeout=hs)
+            if not self.is_cdn:
+                await self.send(
+                    raw.functions.InvokeWithLayer(
+                        layer=_layer,
+                        query=raw.functions.InitConnection(
+                            api_id=await self.client.storage.api_id(),
+                            app_version=self.client.app_version,
+                            device_model=self.client.device_model,
+                            system_version=self.client.system_version,
+                            system_lang_code=self.client.system_lang_code,
+                            lang_code=self.client.lang_code,
+                            lang_pack=self.client.lang_pack,
+                            query=raw.functions.help.GetConfig(),
+                        ),
+                    ),
+                    timeout=hs,
+                )
+            self.ping_task = self.loop.create_task(self.ping_worker())
+            self.is_started.set()
+            log.info("Session restarted (soft / in-process, no dyno exit)")
+            return True
+        except Exception:
+            try:
+                await self.stop()
+            except Exception:
+                pass
+            raise
 
     async def handle_packet(self, packet):
         try:
@@ -396,7 +571,7 @@ class Session:
                 msg_id = msg.body.msg_id
             else:
                 if self.client is not None:
-                    self.loop.create_task(self.client.handle_updates(msg.body))
+                    self.loop.create_task(self._run_update(msg.body))
 
             if msg_id in self.results:
                 self.results[msg_id].value = getattr(msg.body, "result", msg.body)
@@ -411,6 +586,16 @@ class Session:
                 pass
             else:
                 self.pending_acks.clear()
+
+    async def _run_update(self, body):
+        """Bound concurrent update handlers so floods cannot starve user RPCs."""
+        try:
+            async with self._update_semaphore:
+                await self.client.handle_updates(body)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("handle_updates error suppressed: %s: %s", type(e).__name__, e)
 
     async def ping_worker(self):
         log.info("PingTask started")
@@ -484,13 +669,22 @@ class Session:
                 # a bare `except OSError` first would swallow the probe timeout
                 # and we'd never count misses.
                 #
-                # No reply in time == the half-wedge signal: recv_worker is
-                # still happily reading bytes (so it won't restart on its own),
-                # but our RPCs are going unanswered. Count it; once we cross
-                # the threshold, force the same in-process reconnect recv_worker
-                # would do on a dead socket. (self.restart is wrapped single-
-                # flight by the app's session patch, so concurrent restart
-                # requests from recv_worker/handle_packet collapse to one.)
+                # Lag-aware: if the event loop was blocked (heavy CPU/IO on
+                # main), a short probe timeout is a false wedge — don't count.
+                try:
+                    import time as _t
+                    _t0 = _t.monotonic()
+                    await asyncio.sleep(0)
+                    _lag = _t.monotonic() - _t0
+                except Exception:
+                    _lag = 0.0
+                if _lag > 0.05:
+                    log.debug(
+                        "Keep-alive probe miss ignored (event-loop lag %.0fms)",
+                        _lag * 1000,
+                    )
+                    continue
+
                 health_misses += 1
                 log.warning(
                     "Keep-alive probe got no reply (%s/%s) — session may be "
@@ -500,13 +694,12 @@ class Session:
                 if health_misses >= self.PING_HEALTH_MISSES:
                     log.warning(
                         "Keep-alive starvation threshold reached — forcing "
-                        "session restart (in-process, no process exit)."
+                        "IN-PROCESS session restart (never dyno/process exit)."
                     )
                     self.loop.create_task(self.restart())
                     break
             except OSError:
-                # Genuine socket-level failure (connection.send wraps socket
-                # errors as OSError). The original behaviour — reconnect now.
+                # Genuine socket-level failure — soft reconnect only.
                 self.loop.create_task(self.restart())
                 break
             except RPCError:
@@ -538,15 +731,35 @@ class Session:
                     )
 
                 if self.is_started.is_set():
+                    # Awaitable path via create_task still ok; restart is
+                    # single-flight and waiters block on the lock.
                     self.loop.create_task(self.restart())
 
                 break
 
-            self.loop.create_task(self.handle_packet(packet))
+            if self.is_started.is_set():
+                task = self.loop.create_task(self._handle_packet_tracked(packet))
+                self._packet_tasks.add(task)
+                task.add_done_callback(self._packet_tasks.discard)
 
         log.info("NetworkTask stopped")
 
+    async def _handle_packet_tracked(self, packet):
+        try:
+            await self.handle_packet(packet)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("handle_packet error: %s: %s", type(e).__name__, e)
+
     async def send(self, data: TLObject, wait_response: bool = True, timeout: float = WAIT_TIMEOUT, retry: int = 0):
+        # External callers wait for restart; the restart owner must proceed
+        # (handshake Ping/InitConnection) or we deadlock on the lock.
+        await self._wait_if_restarting(timeout=timeout or self.WAIT_TIMEOUT)
+
+        if self.connection is None:
+            raise OSError("session connection is None (not started / mid-restart)")
+
         message = self.msg_factory(data)
         msg_id = message.msg_id
 
@@ -570,6 +783,9 @@ class Session:
         except OSError as e:
             self.results.pop(msg_id, None)
             raise e
+        except AttributeError as e:
+            self.results.pop(msg_id, None)
+            raise OSError(f"session connection send race: {e}") from e
 
         if wait_response:
             try:
@@ -602,6 +818,8 @@ class Session:
             return result
 
     def _handle_bad_notification(self):
+        if not self.stored_msg_ids:
+            return
         new_msg_id = MsgId()
         if self.stored_msg_ids[len(self.stored_msg_ids)-1] >= new_msg_id:
             new_msg_id = self.stored_msg_ids[len(self.stored_msg_ids)-1] + 4
@@ -615,6 +833,13 @@ class Session:
         timeout: float = WAIT_TIMEOUT,
         sleep_threshold: float = SLEEP_THRESHOLD
     ):
+        # Wait for in-flight restart first (never fail-fast to callers).
+        # Owner task skips wait (see _wait_if_restarting).
+        try:
+            await self._wait_if_restarting(timeout=timeout or self.WAIT_TIMEOUT)
+        except TimeoutError:
+            pass
+
         try:
             await asyncio.wait_for(self.is_started.wait(), self.WAIT_TIMEOUT)
         except asyncio.TimeoutError:
@@ -640,7 +865,8 @@ class Session:
                             self.client.name, amount, query_name)
 
                 await asyncio.sleep(amount)
-            except (OSError, InternalServerError, ServiceUnavailable) as e:
+            except (OSError, TimeoutError, asyncio.TimeoutError, InternalServerError, ServiceUnavailable) as e:
+                # TimeoutError is OSError on 3.11+ — still list explicitly.
                 if retries == 0:
                     raise e from None
 
@@ -649,6 +875,20 @@ class Session:
                     Session.MAX_RETRIES - retries + 1,
                     query_name, str(e) or repr(e)
                 )
+
+                # Transport / timeout → soft in-process restart, never dyno exit.
+                # Skip if we are already inside restart (nested invoke during handshake).
+                if (
+                    isinstance(e, (OSError, TimeoutError, asyncio.TimeoutError))
+                    and not self._i_own_restart_lock()
+                ):
+                    try:
+                        await self.restart()
+                    except Exception as rst_err:
+                        log.warning(
+                            "invoke: restart after %s failed: %s",
+                            type(e).__name__, rst_err,
+                        )
 
                 await asyncio.sleep(0.5)
 
