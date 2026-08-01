@@ -733,14 +733,22 @@ class Session:
                 if self.is_started.is_set():
                     # Awaitable path via create_task still ok; restart is
                     # single-flight and waiters block on the lock.
+                    # Only restart a live session: during pre-start handshake
+                    # a dead socket must surface as start() TimeoutError/OSError
+                    # so the attempt budget can retry cleanly.
                     self.loop.create_task(self.restart())
 
                 break
 
-            if self.is_started.is_set():
-                task = self.loop.create_task(self._handle_packet_tracked(packet))
-                self._packet_tasks.add(task)
-                task.add_done_callback(self._packet_tasks.discard)
+            # ALWAYS dispatch packets while the recv loop is alive — including
+            # handshake Ping/InitConnection replies while is_started is still
+            # CLEAR. Gating on is_started (39215db) dropped those replies →
+            # every cold-boot / classic stop→start handshake timed out →
+            # "start() failed after N attempts" crash loop. Soft-restart was
+            # unaffected because it keeps is_started set during reconnect.
+            task = self.loop.create_task(self._handle_packet_tracked(packet))
+            self._packet_tasks.add(task)
+            task.add_done_callback(self._packet_tasks.discard)
 
         log.info("NetworkTask stopped")
 
