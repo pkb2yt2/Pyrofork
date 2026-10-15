@@ -54,7 +54,7 @@ class Session:
     # and left is_started clear forever when combined with an unbounded retry
     # loop. 5s is still far above a healthy DC reply (<1s) but survives brief
     # stalls. App-level session patches may raise this further for main only.
-    START_TIMEOUT = 5
+    START_TIMEOUT = 4
     WAIT_TIMEOUT = 15
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 10
@@ -72,9 +72,9 @@ class Session:
     START_MAX_ATTEMPTS_MAIN = 4
     # Bound stop() worker drains so a wedged recv/ping task cannot hang
     # restart() indefinitely (restart = stop + start).
-    STOP_TASK_DRAIN_TIMEOUT = 8.0
-    STOP_TASK_CANCEL_TIMEOUT = 3.0
-    STOP_CONNECTION_CLOSE_TIMEOUT = 10.0
+    STOP_TASK_DRAIN_TIMEOUT = 2.0
+    STOP_TASK_CANCEL_TIMEOUT = 1.0
+    STOP_CONNECTION_CLOSE_TIMEOUT = 3.0
 
     # ── Response-starvation recovery ────────────────────────────────────
     # The keep-alive ping below is normally fire-and-forget (wait_response
@@ -103,8 +103,12 @@ class Session:
     # side is covered separately by the session-patch MAIN_WAIT_TIMEOUT (sends
     # fail fast so dispatcher workers aren't held) — this is the detection side.
     PING_PROBE_TIMEOUT = 3       # per-probe wait for the Pong (was 10)
-    PING_HEALTH_MISSES = 2       # consecutive misses → restart (was 3)
+    PING_HEALTH_MISSES = 3       # consecutive misses → restart
     PING_WEDGE_BACKOFF = 1.0     # while mid-miss, re-probe this fast (not PING_INTERVAL)
+    # Interactive callers must not sit on a restart for more than this.
+    # Handshake owner skips the wait. External send/invoke fail-fast so
+    # dispatcher workers stay free (bot never "deaf" for tens of seconds).
+    RESTART_WAIT_TIMEOUT = 2.5
 
     TRANSPORT_ERRORS = {
         404: "auth key not found",
@@ -168,7 +172,7 @@ class Session:
         self._update_semaphore = asyncio.Semaphore(24)
         self._packet_tasks: set = set()
         self._last_restart_mono = 0.0
-        self.MIN_RESTART_INTERVAL = 5.0
+        self.MIN_RESTART_INTERVAL = 10.0
 
     async def start(self):
         # Main session: bound attempts so start() always returns (success or
@@ -344,14 +348,19 @@ class Session:
             return False
 
     async def _wait_if_restarting(self, timeout: Optional[float] = None) -> None:
-        """External callers wait for restart; the restart owner must not (deadlock)."""
+        """External callers wait briefly for restart; the restart owner must not (deadlock).
+
+        Cap is RESTART_WAIT_TIMEOUT (not WAIT_TIMEOUT=15s). A 15s wait per
+        send during restart pins dispatcher workers and starves the handshake
+        Ping — the 2026-09-02 deadlock (start() TimeoutError forever).
+        """
         if not self._restart_lock.locked() or self._i_own_restart_lock():
             return
+        cap = self.RESTART_WAIT_TIMEOUT
+        if timeout is not None:
+            cap = min(float(timeout), cap)
         try:
-            await asyncio.wait_for(
-                self._restart_done.wait(),
-                timeout=timeout if timeout is not None else self.WAIT_TIMEOUT,
-            )
+            await asyncio.wait_for(self._restart_done.wait(), timeout=cap)
         except asyncio.TimeoutError:
             raise TimeoutError("Request timed out (waiting for session restart)")
 
@@ -369,12 +378,18 @@ class Session:
         if self._i_own_restart_lock():
             return
 
-        # Already recovering — wait for it (wzgram-style). Do NOT raise.
+        # Already recovering — wait briefly, then return (do not stack).
         if self._restart_lock.locked():
             try:
-                await asyncio.wait_for(self._restart_done.wait(), timeout=45.0)
+                await asyncio.wait_for(
+                    self._restart_done.wait(),
+                    timeout=self.RESTART_WAIT_TIMEOUT,
+                )
             except asyncio.TimeoutError:
-                log.warning("Session restart wait timed out (45s); continuing")
+                log.warning(
+                    "Session restart wait timed out (%.1fs); not stacking",
+                    self.RESTART_WAIT_TIMEOUT,
+                )
             return
 
         async with self._restart_lock:
@@ -398,15 +413,19 @@ class Session:
 
                 soft_ok = False
                 if not (self.is_media or self.is_cdn):
-                    try:
-                        soft_ok = await self._restart_soft()
-                    except Exception as soft_err:
-                        log.warning(
-                            "Soft session restart failed (%s: %s); "
-                            "falling back to classic stop→start",
-                            type(soft_err).__name__, soft_err,
-                        )
-                        soft_ok = False
+                    for _soft_try in (1, 2):
+                        try:
+                            soft_ok = await self._restart_soft()
+                            break
+                        except Exception as soft_err:
+                            log.warning(
+                                "Soft session restart try %s/2 failed (%s: %s)%s",
+                                _soft_try,
+                                type(soft_err).__name__,
+                                soft_err,
+                                "; retrying soft" if _soft_try == 1 else "; falling back to classic stop→start",
+                            )
+                            soft_ok = False
 
                 if not soft_ok:
                     await self.stop()
@@ -449,7 +468,7 @@ class Session:
         self.recv_task = None
         if old_connection is not None:
             try:
-                await asyncio.wait_for(old_connection.close(), timeout=5.0)
+                await asyncio.wait_for(old_connection.close(), timeout=2.0)
             except Exception as e:
                 log.debug("soft-restart close: %s", e)
 
@@ -466,7 +485,7 @@ class Session:
         try:
             await new_connection.connect()
             self.recv_task = self.loop.create_task(self.recv_worker())
-            hs = max(float(self.START_TIMEOUT or 5), 6.0)
+            hs = float(self.START_TIMEOUT or 4)
             # send() must not wait on restart lock — we own it (see _i_own_restart_lock).
             await self.send(raw.functions.Ping(ping_id=0), timeout=hs)
             if not self.is_cdn:
@@ -649,6 +668,17 @@ class Session:
             # probing then could race and false-trigger a second restart.
             if not self.is_started.is_set():
                 continue
+            # First ~30s after start: DC/handshake still settling. Counting
+            # misses here restarted a live boot session and made check_logs
+            # think LOGS_CHANNEL was invalid (2026-09-02).
+            try:
+                import time as _tsettle
+                _until = float(getattr(self, "_unzipbot_settle_until", 0) or 0)
+                if _until and _tsettle.monotonic() < _until:
+                    health_misses = 0
+                    continue
+            except Exception:
+                pass
 
             try:
                 # Was wait_response=False (fire-and-forget). Now we WAIT for
@@ -692,6 +722,13 @@ class Session:
                     health_misses, self.PING_HEALTH_MISSES
                 )
                 if health_misses >= self.PING_HEALTH_MISSES:
+                    if self._restart_lock.locked() or getattr(
+                        self, "_unzipbot_restart_inflight", False
+                    ):
+                        # Recovery already running — do not stack a second
+                        # restart (that was the 2026-09-02 dual-restart storm).
+                        health_misses = 0
+                        continue
                     log.warning(
                         "Keep-alive starvation threshold reached — forcing "
                         "IN-PROCESS session restart (never dyno/process exit)."
@@ -700,7 +737,11 @@ class Session:
                     break
             except OSError:
                 # Genuine socket-level failure — soft reconnect only.
-                self.loop.create_task(self.restart())
+                if not (
+                    self._restart_lock.locked()
+                    or getattr(self, "_unzipbot_restart_inflight", False)
+                ):
+                    self.loop.create_task(self.restart())
                 break
             except RPCError:
                 # The server answered with an error — the request/response

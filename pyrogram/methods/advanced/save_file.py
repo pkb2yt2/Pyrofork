@@ -8,14 +8,6 @@
 #  it under the terms of the GNU Lesser General Public License as published
 #  by the Free Software Foundation, either version 3 of the License, or
 #  (at your option) any later version.
-#
-#  Pyrofork is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with Pyrofork.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
 import functools
@@ -23,6 +15,8 @@ import inspect
 import io
 import logging
 import math
+import os
+import time
 from hashlib import md5
 from pathlib import PurePath
 from typing import Union, BinaryIO, Callable
@@ -30,12 +24,176 @@ from typing import Union, BinaryIO, Callable
 import pyrogram
 from pyrogram import StopTransmission
 from pyrogram import raw
+from pyrogram.errors import (
+    RPCError, FloodWait, FloodPremiumWait,
+    InternalServerError, ServiceUnavailable,
+)
+from pyrogram.methods.advanced.upload_pacer import AdaptiveBucket
 from pyrogram.session import Session
 
 log = logging.getLogger(__name__)
 
+PART_SIZE = 512 * 1024
+POOL_CAP = 20
+WORKERS_PER_SESSION = 2
+# One media connection must not carry more than this many upload RPCs.
+# Past it, every request on that socket times out together.
+INFLIGHT_PER_SESSION = 6
+MAX_RETRIES = 16
+STALL_TIMEOUT = 900
+MAX_BATCH = 4 * 1024 * 1024
+PACER_BURST = 16
+POOL_IDLE_SECONDS = 300
+MEDIA_PART_TIMEOUT = 60
+
+
+def upload_pool_size(is_bot, is_premium, parts_left):
+    """How many media connections this upload should use.
+
+    Premium accounts get the wide pool. Bots and normal users stay smaller
+    because their flood budget is lower. ``PYROFORK_UPLOAD_MAX_SESSIONS`` is
+    still an optional ceiling.
+    """
+    parts_left = max(1, int(parts_left or 1))
+    # One connection can usefully feed two workers, so don't open more
+    # sockets than half the remaining parts.
+    part_cap = max(1, math.ceil(parts_left / WORKERS_PER_SESSION))
+
+    def _env_int(name, default):
+        try:
+            return int(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    if is_bot:
+        want = _env_int("PYROFORK_UPLOAD_POOL_BOT", 8)
+    elif is_premium:
+        want = _env_int("PYROFORK_UPLOAD_POOL_PREMIUM", 14)
+    else:
+        want = _env_int("PYROFORK_UPLOAD_POOL_USER", 12)
+
+    ceiling = _env_int("PYROFORK_UPLOAD_MAX_SESSIONS", POOL_CAP)
+    return max(1, min(want, ceiling, POOL_CAP, part_cap))
+
+
+def _inflight(session):
+    sem = getattr(session, "_upload_inflight", None)
+    if sem is None:
+        sem = asyncio.Semaphore(INFLIGHT_PER_SESSION)
+        session._upload_inflight = sem
+    return sem
+
+
+async def _stop_quiet(session):
+    try:
+        await session.stop()
+    except Exception:
+        log.debug("upload pool: stop failed", exc_info=True)
+
+
+async def _stop_workers(queue, workers):
+    """Deliver one sentinel per worker that is still running.
+
+    The queue is bounded by the worker count. Putting a sentinel after the
+    workers have already exited waits forever, and save_file_semaphore stays
+    held for every later upload.
+    """
+    delivered = 0
+    for _ in workers:
+        if all(t.done() for t in workers):
+            break
+        try:
+            await asyncio.wait_for(queue.put(None), MEDIA_PART_TIMEOUT)
+        except asyncio.TimeoutError:
+            break
+        delivered += 1
+
+    if delivered < len(workers):
+        for task in workers:
+            if not task.done():
+                task.cancel()
+
+    return await asyncio.gather(*workers, return_exceptions=True)
+
+
+def _raise_worker_errors(results):
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
+
 
 class SaveFile:
+    async def _acquire_upload_sessions(self, dc_id, count):
+        """Reuse media sessions on this DC. Downloads do not use this pool."""
+        pools = self.upload_session_pools
+        lock = self.upload_session_pools_lock
+        async with lock:
+            pool = pools.setdefault(dc_id, [])
+            now = time.monotonic()
+            kept = []
+            for session in pool:
+                in_use = getattr(session, "_upload_users", 0)
+                started = session.is_started.is_set()
+                idle_for = now - getattr(session, "_upload_last_used", now)
+                if not started and in_use == 0:
+                    await _stop_quiet(session)
+                    continue
+                if in_use == 0 and idle_for > POOL_IDLE_SECONDS and len(kept) >= count:
+                    await _stop_quiet(session)
+                    continue
+                kept.append(session)
+            pool[:] = kept
+
+            needed = count - len(pool)
+            if needed > 0:
+                auth_key = await self.storage.auth_key()
+                test_mode = await self.storage.test_mode()
+                while needed > 0:
+                    chunk = min(needed, 3)
+                    created = await asyncio.gather(*(
+                        self._start_upload_session(dc_id, auth_key, test_mode)
+                        for _ in range(chunk)
+                    ), return_exceptions=True)
+                    ok = [s for s in created if not isinstance(s, BaseException)]
+                    failed = [s for s in created if isinstance(s, BaseException)]
+                    pool.extend(ok)
+                    if failed:
+                        if not pool:
+                            raise failed[0]
+                        log.warning(
+                            "Upload pool for DC %s is short by %d session(s): %s",
+                            dc_id, needed - len(ok), failed[0],
+                        )
+                        break
+                    needed -= chunk
+
+            chosen = list(pool[:count])
+            for session in chosen:
+                session._upload_users = getattr(session, "_upload_users", 0) + 1
+                session._upload_last_used = now
+            return chosen
+
+    async def _start_upload_session(self, dc_id, auth_key, test_mode):
+        session = Session(self, dc_id, auth_key, test_mode, is_media=True)
+        try:
+            await session.start()
+        except BaseException:
+            await _stop_quiet(session)
+            raise
+        return session
+
+    async def _release_upload_sessions(self, sessions):
+        if not sessions:
+            return
+        lock = getattr(self, "upload_session_pools_lock", None)
+        if lock is None:
+            return
+        async with lock:
+            now = time.monotonic()
+            for session in sessions:
+                session._upload_users = max(0, getattr(session, "_upload_users", 1) - 1)
+                session._upload_last_used = now
+
     async def save_file(
         self: "pyrogram.Client",
         path: Union[str, BinaryIO],
@@ -98,178 +256,289 @@ class SaveFile:
             if path is None:
                 return None
 
-            async def worker(session):
-                while True:
-                    data = await queue.get()
-
-                    if data is None:
-                        return
-
-                    try:
-                        await session.invoke(data)
-                    except Exception as e:
-                        log.exception(e)
-
-            part_size = 512 * 1024
-
-            # ── Multi-session parallel upload (FastTelethon-style) ──────────────
-            # Stock pyrofork creates ONE Session and N workers sharing it, so the
-            # N chunks still serialize over a SINGLE TCP connection — throughput is
-            # latency-bound (~4 chunks per round-trip). Opening N SEPARATE Sessions
-            # to the same media DC lets N chunks fly over N independent connections
-            # at once, hiding round-trip latency → several-x faster on a high-RTT
-            # host (Heroku→Telegram). Connection count scales with file size and is
-            # capped (PYROFORK_UPLOAD_MAX_SESSIONS, default 8) to stay clear of
-            # Telegram per-IP flood limits. Tunable via env at runtime.
-            import os as _os
-            try:
-                _max_up_sessions = int(_os.environ.get("PYROFORK_UPLOAD_MAX_SESSIONS", "8") or "8")
-            except ValueError:
-                _max_up_sessions = 8
-            _max_up_sessions = max(1, min(16, _max_up_sessions))
+            part_size = PART_SIZE
+            opened_here = False
+            sessions = []
+            workers = []
+            queue = None
+            next_batch_task = None
+            fp = None
 
             if isinstance(path, (str, PurePath)):
                 fp = open(path, "rb")
+                opened_here = True
             elif isinstance(path, io.IOBase):
                 fp = path
             else:
-                raise ValueError("Invalid file. Expected a file path as string or a binary (not text) file pointer")
+                raise ValueError(
+                    "Invalid file. Expected a file path as string or a binary (not text) file pointer"
+                )
 
             file_name = getattr(fp, "name", "file.jpg")
 
-            fp.seek(0, io.SEEK_END)
-            file_size = fp.tell()
-            fp.seek(0)
-
-            if file_size == 0:
-                raise ValueError("File size equals to 0 B")
-
-            file_size_limit_mib = 4000 if self.me.is_premium else 2000
-
-            if file_size > file_size_limit_mib * 1024 * 1024:
-                raise ValueError(f"Can't upload files bigger than {file_size_limit_mib} MiB")
-
-            file_total_parts = int(math.ceil(file_size / part_size))
-            is_big = file_size > 10 * 1024 * 1024
-            is_missing_part = file_id is not None
-            # Scale connection count with size: ~1 session per 100 MB, between 4
-            # and the configured max, never more than there are parts to send.
-            # A single missing-part re-upload needs just one connection.
-            if is_big and not is_missing_part:
-                workers_count = min(
-                    _max_up_sessions,
-                    max(4, int(math.ceil(file_size / (100 * 1024 * 1024)))),
-                    max(1, file_total_parts),
-                )
-            else:
-                workers_count = 1
-            file_id = file_id or self.rnd_id()
-            md5_sum = md5() if not is_big and not is_missing_part else None
-
-            # One independent Session per worker (was a single shared session).
-            _dc_id = await self.storage.dc_id()
-            _auth_key = await self.storage.auth_key()
-            _test_mode = await self.storage.test_mode()
-            sessions = [
-                Session(self, _dc_id, _auth_key, _test_mode, is_media=True)
-                for _ in range(workers_count)
-            ]
-            # Backwards-compat alias: the non-big md5 path and the finally block
-            # below were written around a single `session`; keep one named.
-            session = sessions[0]
-            # Deeper queue so the producer can stage chunks ahead of N workers
-            # instead of blocking after every single put (old maxsize was 1).
-            queue = asyncio.Queue(max(1, workers_count * 2))
-            workers = [self.loop.create_task(worker(s)) for s in sessions]
-
             try:
-                # Start all sessions; return_exceptions so one failing start()
-                # doesn't leave its siblings mid-connect (default gather leaves
-                # them running). If ANY session failed to start, abort the whole
-                # upload — the finally still stops every session (stop() is now
-                # None-safe), so nothing leaks.
-                _start_results = await asyncio.gather(
-                    *[s.start() for s in sessions], return_exceptions=True
+                fp.seek(0, os.SEEK_END)
+                file_size = fp.tell()
+                fp.seek(0)
+
+                if file_size == 0:
+                    raise ValueError("File size equals to 0 B")
+
+                is_bot = bool(getattr(self.me, "is_bot", False))
+                is_premium = bool(getattr(self.me, "is_premium", False))
+                file_size_limit_mib = 4000 if is_premium else 2000
+
+                if file_size > file_size_limit_mib * 1024 * 1024:
+                    raise ValueError(
+                        f"Can't upload files bigger than {file_size_limit_mib} MiB"
+                    )
+
+                file_total_parts = int(math.ceil(file_size / part_size))
+                is_big = file_size > 10 * 1024 * 1024
+                is_missing_part = file_id is not None
+                file_id = file_id or self.rnd_id()
+                md5_sum = md5() if not is_big and not is_missing_part else None
+
+                parts_left = 1 if is_missing_part else max(1, file_total_parts - file_part)
+                pool_size = 1 if is_missing_part or not is_big else upload_pool_size(
+                    is_bot, is_premium, parts_left,
                 )
-                _start_errors = [r for r in _start_results if isinstance(r, BaseException)]
-                if _start_errors:
-                    raise _start_errors[0]
 
-                fp.seek(part_size * file_part)
+                dc_id = await self.storage.dc_id()
+                sessions = await self._acquire_upload_sessions(dc_id, pool_size)
+                if not sessions:
+                    raise OSError(f"No upload session available for DC {dc_id}")
 
-                while True:
-                    chunk = fp.read(part_size)
+                n_workers = min(
+                    len(sessions) * WORKERS_PER_SESSION,
+                    len(sessions) * INFLIGHT_PER_SESSION,
+                    parts_left,
+                )
+                n_workers = max(1, n_workers)
+                queue = asyncio.Queue(n_workers)
+                acked = [0]
+                stalled_since = [0.0]
 
-                    if not chunk:
-                        if not is_big and not is_missing_part:
-                            md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
-                        break
+                if is_bot:
+                    rate = _env_rate("PYROFORK_UPLOAD_RATE_BOT", 32)
+                elif is_premium:
+                    rate = _env_rate("PYROFORK_UPLOAD_RATE_PREMIUM", 300)
+                else:
+                    rate = _env_rate("PYROFORK_UPLOAD_RATE_USER", 32)
+                pacer = AdaptiveBucket(rate=rate, ceiling=max(rate, 300), burst=PACER_BURST, step=1.0)
+                paced = is_bot or not is_premium
 
-                    if is_big:
-                        rpc = raw.functions.upload.SaveBigFilePart(
-                            file_id=file_id,
-                            file_part=file_part,
-                            file_total_parts=file_total_parts,
-                            bytes=chunk
-                        )
-                    else:
-                        rpc = raw.functions.upload.SaveFilePart(
-                            file_id=file_id,
-                            file_part=file_part,
-                            bytes=chunk
-                        )
+                async def _send_part(session, data):
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            accepted = await session.invoke(
+                                data,
+                                timeout=MEDIA_PART_TIMEOUT,
+                                sleep_threshold=0,
+                            )
+                            if not accepted:
+                                raise OSError("part not accepted by the server")
+                            return
+                        except StopTransmission:
+                            raise
+                        except (FloodWait, FloodPremiumWait) as exc:
+                            if attempt == MAX_RETRIES - 1:
+                                raise
+                            delay = exc.value if isinstance(exc.value, int) else 1
+                            delay = min(max(delay, 1), 300)
+                            pacer.on_flood()
+                            log.warning(
+                                "Retrying upload part after flood (attempt %d/%d, %ss)",
+                                attempt + 1, MAX_RETRIES, delay,
+                            )
+                            await asyncio.sleep(delay)
+                        except (OSError, TimeoutError, asyncio.TimeoutError,
+                                InternalServerError, ServiceUnavailable) as exc:
+                            if attempt == MAX_RETRIES - 1:
+                                log.exception("Upload part failed after %d attempts", MAX_RETRIES)
+                                raise
+                            delay = min(2 ** attempt, 30)
+                            log.warning(
+                                "Retrying upload part (attempt %d/%d): %s",
+                                attempt + 1, MAX_RETRIES, str(exc)[:120],
+                            )
+                            await asyncio.sleep(delay)
+                        except RPCError as exc:
+                            code = exc.CODE or 0
+                            if 500 <= code < 600 and attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep(min(2 ** attempt, 30))
+                                continue
+                            raise
 
-                    await queue.put(rpc)
+                async def worker(session):
+                    slots = _inflight(session)
+                    while True:
+                        data = await queue.get()
+                        if data is None:
+                            return
+                        try:
+                            async with slots:
+                                await _send_part(session, data)
+                            acked[0] += 1
+                            stalled_since[0] = 0.0
+                            if paced:
+                                pacer.on_success()
+                        finally:
+                            data = None
 
-                    if is_missing_part:
+                async def read_batch():
+                    batch_size = min(part_size * n_workers, MAX_BATCH)
+                    return await self.loop.run_in_executor(self.executor, fp.read, batch_size)
+
+                async def check_workers():
+                    for task in workers:
+                        if task.done() and not task.cancelled():
+                            exc = task.exception()
+                            if exc is not None:
+                                raise exc
+
+                last_reported = [-1]
+
+                async def report(parts):
+                    if not progress or parts == last_reported[0]:
                         return
-
-                    if not is_big and not is_missing_part:
-                        md5_sum.update(chunk)
-
-                    file_part += 1
-
-                    if progress:
-                        func = functools.partial(
-                            progress,
-                            min(file_part * part_size, file_size),
-                            file_size,
-                            *progress_args
-                        )
-
+                    last_reported[0] = parts
+                    func = functools.partial(
+                        progress,
+                        min(parts * part_size, file_size),
+                        file_size,
+                        *progress_args,
+                    )
+                    try:
                         if inspect.iscoroutinefunction(progress):
                             await func()
                         else:
                             await self.loop.run_in_executor(self.executor, func)
-            except StopTransmission:
-                raise
-            except Exception as e:
-                log.exception(e)
-            else:
+                    except StopTransmission:
+                        raise
+                    except Exception as exc:
+                        log.warning("Upload progress callback error: %s", exc)
+
+                workers = [
+                    self.loop.create_task(worker(sessions[i % len(sessions)]))
+                    for i in range(n_workers)
+                ]
+
+                fp.seek(part_size * file_part)
+                next_batch_task = self.loop.create_task(read_batch())
+
+                while True:
+                    batch = await next_batch_task
+                    next_batch_task = self.loop.create_task(read_batch())
+
+                    if not batch:
+                        next_batch_task.cancel()
+                        next_batch_task = None
+                        if md5_sum is not None:
+                            md5_sum = md5_sum.hexdigest()
+                        break
+
+                    await check_workers()
+
+                    for start in range(0, len(batch), part_size):
+                        chunk = batch[start:start + part_size]
+                        if is_big:
+                            rpc = raw.functions.upload.SaveBigFilePart(
+                                file_id=file_id,
+                                file_part=file_part,
+                                file_total_parts=file_total_parts,
+                                bytes=chunk,
+                            )
+                        else:
+                            rpc = raw.functions.upload.SaveFilePart(
+                                file_id=file_id,
+                                file_part=file_part,
+                                bytes=chunk,
+                            )
+
+                        if paced:
+                            await pacer.acquire()
+
+                        while True:
+                            # A dead worker never drains the queue. Wake as soon
+                            # as one exits, instead of waiting out the put timeout.
+                            put_task = asyncio.ensure_future(queue.put(rpc))
+                            live = [t for t in workers if not t.done()]
+                            done, _pending = await asyncio.wait(
+                                [put_task, *live],
+                                timeout=30,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if put_task in done and not put_task.cancelled():
+                                put_exc = put_task.exception()
+                                if put_exc is not None:
+                                    raise put_exc
+                                await check_workers()
+                                break
+                            if not put_task.done():
+                                put_task.cancel()
+                            await check_workers()
+                            if not done:
+                                now = time.monotonic()
+                                if stalled_since[0] == 0.0:
+                                    stalled_since[0] = now
+                                    log.warning(
+                                        "Upload queue full: workers throttled, waiting up to %ss",
+                                        STALL_TIMEOUT,
+                                    )
+                                elif now - stalled_since[0] > STALL_TIMEOUT:
+                                    raise TimeoutError(
+                                        f"Upload stalled: no part completed for {STALL_TIMEOUT}s"
+                                    )
+
+                        if is_missing_part:
+                            if next_batch_task is not None and not next_batch_task.done():
+                                next_batch_task.cancel()
+                            _raise_worker_errors(await _stop_workers(queue, workers))
+                            workers = []
+                            return None
+
+                        if md5_sum is not None:
+                            md5_sum.update(chunk)
+
+                        file_part += 1
+                        await report(acked[0])
+
+                    batch = None
+
+                _raise_worker_errors(await _stop_workers(queue, workers))
+                workers = []
+                await report(file_total_parts)
+
                 if is_big:
                     return raw.types.InputFileBig(
                         id=file_id,
                         parts=file_total_parts,
                         name=file_name,
-
                     )
-                else:
-                    return raw.types.InputFile(
-                        id=file_id,
-                        parts=file_total_parts,
-                        name=file_name,
-                        md5_checksum=md5_sum
-                    )
-            finally:
-                for _ in workers:
-                    await queue.put(None)
-
-                await asyncio.gather(*workers)
-
-                # Stop EVERY session we opened (was a single session.stop()).
-                await asyncio.gather(
-                    *[s.stop() for s in sessions], return_exceptions=True
+                return raw.types.InputFile(
+                    id=file_id,
+                    parts=file_total_parts,
+                    name=file_name,
+                    md5_checksum=md5_sum,
                 )
-
-                if isinstance(path, (str, PurePath)):
+            except StopTransmission:
+                raise
+            finally:
+                if next_batch_task is not None and not next_batch_task.done():
+                    next_batch_task.cancel()
+                if workers and queue is not None:
+                    try:
+                        await _stop_workers(queue, workers)
+                    except Exception:
+                        log.debug("upload: worker shutdown failed", exc_info=True)
+                await self._release_upload_sessions(sessions)
+                if opened_here and fp is not None:
                     fp.close()
+
+
+def _env_rate(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default

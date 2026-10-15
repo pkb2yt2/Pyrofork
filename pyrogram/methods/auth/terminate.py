@@ -53,6 +53,16 @@ class Terminate:
 
         self.media_sessions.clear()
 
+        for pool in list(getattr(self, "upload_session_pools", {}).values()):
+            for upload_session in pool:
+                try:
+                    await upload_session.stop()
+                except Exception:
+                    pass
+
+        if getattr(self, "upload_session_pools", None) is not None:
+            self.upload_session_pools.clear()
+
         self.updates_watchdog_event.set()
 
         if self.updates_watchdog_task is not None:

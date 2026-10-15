@@ -355,6 +355,9 @@ class Client(Methods):
 
         self.media_sessions = {}
         self.media_sessions_lock = asyncio.Lock()
+        # Upload-only pool. Downloads keep using media_sessions (one session).
+        self.upload_session_pools = {}
+        self.upload_session_pools_lock = asyncio.Lock()
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
         self.get_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
